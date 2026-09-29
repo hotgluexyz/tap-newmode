@@ -10,47 +10,53 @@ plugins:
     namespace: "tap_newmode"
     pip_url: -e .
     capabilities:
-    - state
     - catalog
     - discover
     - about
     - stream-maps
     - structured-logging
 
-    # TODO: Declare settings and their types here:
     settings:
     - name: client_id
       label: Client ID
-      description: OAuth client ID for the NewMode OAuth app
+      description: New/Mode OAuth client id
       sensitive: true
 
     - name: client_secret
-      label: Password
-      description: OAuth client secret for the NewMode OAuth app
+      label: Client Secret
+      description: New/Mode OAuth client secret
       sensitive: true
 
-    - name: refresh_token
-      label: Refresh Token
-      description: OAuth refresh token for the NewMode OAuth app
-      sensitive: true
+    - name: api_base_url
+      label: API Base URL
+      description: New/Mode API base URL
 
     - name: start_date
       kind: date_iso8601
       label: Start Date
       description: Initial date to start extracting data from
 
-    - name: api_url
-      label: API URL
-      description: Base URL for the NewMode API
+    - name: _refresh_token_via_hg_api
+      kind: boolean
+      label: Refresh Token Via Hotglue API
+      description: Fetch access tokens from the Hotglue access token endpoint
 
-    # TODO: Declare required settings here:
+    - name: access_token
+      label: Access Token
+      description: Current access token, managed by the tap
+      sensitive: true
+
+    - name: expires_in
+      kind: integer
+      label: Token Expiry
+      description: Epoch seconds when the access token expires, managed by the tap
+
     settings_group_validation:
     - [client_id, client_secret]
 
-    # TODO: Declare default configuration values here:
     config:
-      start_date: 6 months ago
-      api_url: https://base.newmode.net
+      api_base_url: https://base.newmode.net
+      _refresh_token_via_hg_api: false
 
   loaders:
   - name: target-jsonl

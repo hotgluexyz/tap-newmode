@@ -1,4 +1,4 @@
-"""NewMode tap class."""
+"""New/Mode tap class."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from hotglue_singer_sdk.authenticators import OAuthAuthenticator
 from typing_extensions import override
 
 from tap_newmode.auth import NewModeAuthenticator
+from tap_newmode.client import DEFAULT_BASE_URL
 from tap_newmode.streams import (
     ContactsStream,
 )
@@ -20,40 +21,54 @@ STREAM_TYPES = [
 
 
 class TapNewMode(Tap):
-    """Singer tap for NewMode."""
+    """Singer tap for New/Mode."""
 
     name = "tap-newmode"
 
-    # TODO: Update this section with the actual config values you expect:
+    # Config keys mirror target-newmode so one connector config drives both.
     config_jsonschema = th.PropertiesList(
-        th.Property(
-            "start_date",
-            th.DateTimeType,
-            description="The earliest record date to sync",
-            default="2000-01-01T00:00:00Z",
-        ),
-        th.Property(
-            "api_url",
-            th.StringType,
-            description="Base URL for the NewMode API",
-            default="https://base.newmode.net",
-        ),
         th.Property(
             "client_id",
             th.StringType,
             required=True,
-            description="OAuth client ID for the NewMode OAuth app",
+            description="New/Mode OAuth client id.",
         ),
         th.Property(
             "client_secret",
             th.StringType,
             required=True,
-            description="OAuth client secret for the NewMode OAuth app",
+            description="New/Mode OAuth client secret.",
         ),
         th.Property(
-            "refresh_token",
+            "api_base_url",
             th.StringType,
-            description="OAuth refresh token for the NewMode OAuth app",
+            description=f"New/Mode API base URL. Defaults to {DEFAULT_BASE_URL}.",
+        ),
+        th.Property(
+            "start_date",
+            th.DateTimeType,
+            description="The earliest record date to sync.",
+            default="2000-01-01T00:00:00Z",
+        ),
+        th.Property(
+            "_refresh_token_via_hg_api",
+            th.BooleanType,
+            default=False,
+            description=(
+                "Fetch access tokens from the Hotglue access token endpoint instead of "
+                "running the client-credentials grant against New/Mode directly. Requires "
+                "the TENANT, API_KEY, FLOW, ENV_ID and TAP environment variables."
+            ),
+        ),
+        th.Property(
+            "access_token",
+            th.StringType,
+            description="Current access token. Populated by the tap after authenticating.",
+        ),
+        th.Property(
+            "expires_in",
+            th.IntegerType,
+            description="Epoch seconds when the access token expires. Managed by the tap.",
         ),
     ).to_dict()
 
@@ -67,13 +82,18 @@ class TapNewMode(Tap):
         cls,
         connector: Any = None,
     ) -> tuple[type[OAuthAuthenticator], str]:
-        """Return the authenticator class and OAuth token endpoint.
+        """Return the authenticator class and the New/Mode OAuth token endpoint.
+
+        Args:
+            connector: The tap instance, used to read ``api_base_url`` when set.
 
         Returns:
             A tuple with the authenticator class and the OAuth token endpoint URL.
         """
-        # TODO: replace with the real OAuth token endpoint for your vendor.
-        return NewModeAuthenticator, "https://base.newmode.net/oauth/token"
+        base_url = DEFAULT_BASE_URL
+        if connector is not None:
+            base_url = (connector.config.get("api_base_url") or DEFAULT_BASE_URL).rstrip("/")
+        return NewModeAuthenticator, f"{base_url}/oauth/token"
 
 
 if __name__ == "__main__":

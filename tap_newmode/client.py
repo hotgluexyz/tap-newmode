@@ -1,34 +1,41 @@
-"""HTTP API client (REST or GraphQL), including NewModeStream base class."""
+"""REST client handling, including NewModeStream base class."""
 
 from __future__ import annotations
 
 from functools import cached_property
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
+import backoff
 import requests
 from hotglue_singer_sdk.authenticators import APIAuthenticatorBase
-from hotglue_singer_sdk.helpers.jsonpath import extract_jsonpath
 from hotglue_singer_sdk.streams import RESTStream
 from typing_extensions import override
 
+JSON_API_MEDIA_TYPE = "application/vnd.api+json"
+DEFAULT_BASE_URL = "https://base.newmode.net"
+PAGE_SIZE = 50
+
 
 class NewModeStream(RESTStream):
-    """NewMode stream class."""
+    """New/Mode JSON:API stream class."""
 
-    # Update this value if necessary or override `parse_response`.
-    records_jsonpath = "$[*]"
+    # JSON:API returns resources under `data`.
+    records_jsonpath = "$.data[*]"
+    # Pagination is offset based; the token is computed from `links.next`.
+    next_page_token_jsonpath = None
+    page_size = PAGE_SIZE
 
-    # TODO: set to the jsonpath of the next-page token in your API's response, or
-    # set to None if pagination uses headers / a different mechanism.
-    next_page_token_jsonpath = "$.next_page"
+    # The contact collection routinely takes ~55s and the upstream gateway cuts
+    # requests off at 60s, so 504s are common and expected rather than fatal.
+    extra_retry_statuses: list[int] = [429, 504]
 
     @override
     @property
     def url_base(self) -> str:
-        """Return the API URL root, configurable via the ``api_url`` tap setting."""
-        # TODO: You can make the base URL dynamic here — for example, return different API URIs
-        # based on flags such as sandbox, country/region, or other environment cues.
-        return self.config.get("api_url", "https://base.newmode.net")
+        """Return the JSON:API root, configurable via the ``api_base_url`` setting."""
+        base_url = (self.config.get("api_base_url") or DEFAULT_BASE_URL).rstrip("/")
+        return f"{base_url}/jsonapi"
 
     @override
     @cached_property
@@ -39,43 +46,61 @@ class NewModeStream(RESTStream):
             An authenticator instance.
         """
         authenticator_cls, auth_endpoint = self._tap.access_token_support(self._tap)
-        return authenticator_cls(self, self.config, auth_endpoint=auth_endpoint)
+        return authenticator_cls(self, auth_endpoint=auth_endpoint)
 
     @override
     @property
     def http_headers(self) -> dict:
         """Return the http headers needed.
 
+        New/Mode rejects `application/json` on the JSON:API routes with a 415.
+
         Returns:
             A dictionary of HTTP headers.
         """
-        return {}
+        return {"Accept": JSON_API_MEDIA_TYPE}
 
+    @override
+    def backoff_wait_generator(self) -> Any:
+        """Cap the exponential backoff so a slow collection is not waited out for minutes."""
+        return backoff.expo(factor=3, max_value=60)
+
+    @override
+    def backoff_max_tries(self) -> int:
+        """Retry more than the SDK default, since 504s here are frequent."""
+        return 8
+
+    @override
     def get_next_page_token(
         self,
         response: requests.Response,
         previous_token: Any | None,
     ) -> Any | None:
-        """Return token identifying next page or None if all records have been read.
+        """Return the next `page[offset]`, or None when the last page was read.
+
+        JSON:API advertises a `links.next` href only while more records remain, so
+        its absence ends pagination.
 
         Args:
             response: A raw `requests.Response`_ object.
-            previous_token: Previous pagination reference.
+            previous_token: Previous pagination offset.
 
         Returns:
-            Reference value to retrieve next page.
+            The offset to request next, or None.
 
         .. _requests.Response:
             https://requests.readthedocs.io/en/latest/api/#requests.Response
         """
-        if self.next_page_token_jsonpath:
-            all_matches = extract_jsonpath(self.next_page_token_jsonpath, response.json())
-            first_match = next(iter(all_matches), None)
-            next_page_token = first_match
-        else:
-            next_page_token = response.headers.get("X-Next-Page", None)
+        next_link = (response.json().get("links") or {}).get("next") or {}
+        next_href = next_link.get("href")
+        if not next_href:
+            return None
 
-        return next_page_token
+        # Prefer the offset the API itself advertises; fall back to advancing a page.
+        offsets = parse_qs(urlparse(next_href).query).get("page[offset]")
+        if offsets and offsets[0].isdigit():
+            return int(offsets[0])
+        return (previous_token or 0) + self.page_size
 
     @override
     def get_url_params(
@@ -87,54 +112,44 @@ class NewModeStream(RESTStream):
 
         Args:
             context: The stream context.
-            next_page_token: The next page index or value.
+            next_page_token: The offset to request.
 
         Returns:
             A dictionary of URL query parameters.
         """
-        # TODO: replace with your API's actual query params (pagination token, date filters, etc.).
-        params: dict = {}
+        params: dict = {"page[limit]": self.page_size}
         if next_page_token:
-            params["page"] = next_page_token
-        if self.replication_key:
-            params["sort"] = "asc"
-            params["order_by"] = self.replication_key
+            params["page[offset]"] = next_page_token
         return params
 
     @override
-    def prepare_request_payload(
-        self,
-        context: dict | None,
-        next_page_token: Any | None,
-    ) -> dict | None:
-        """Prepare the data payload for the REST API request.
+    def response_error_message(self, response: requests.Response) -> str:
+        """Summarize the JSON:API `errors` array when the API returns one.
 
-        By default, no payload will be sent (return None).
+        Gateway timeouts come back as HTML, so the body is not assumed to be JSON.
 
         Args:
-            context: The stream context.
-            next_page_token: The next page index or value.
+            response: A `requests.Response`_ object.
 
         Returns:
-            A dictionary with the JSON body for a POST requests.
+            The error message.
+
+        .. _requests.Response:
+            https://requests.readthedocs.io/en/latest/api/#requests.Response
         """
-        # TODO: Delete this method if no payload is required. (Most REST APIs.)
-        return None
+        try:
+            errors = response.json().get("errors")
+        except ValueError:
+            errors = None
+        if not errors:
+            return super().response_error_message(response)
 
-    @override
-    def post_process(
-        self,
-        row: dict,
-        context: dict | None = None,
-    ) -> dict | None:
-        """As needed, append or transform raw data to match expected structure.
-
-        Args:
-            row: An individual record from the stream.
-            context: The stream context.
-
-        Returns:
-            The updated record dictionary, or ``None`` to skip the record.
-        """
-        # TODO: Delete this method if not needed.
-        return row
+        details = []
+        for error in errors:
+            if not isinstance(error, dict):
+                continue
+            pointer = (error.get("source") or {}).get("pointer")
+            detail = error.get("detail") or error.get("title") or ""
+            details.append(f"{pointer}: {detail}" if pointer else detail)
+        summary = "; ".join(detail for detail in details if detail)
+        return f"{response.status_code} from {urlparse(response.url).path}: {summary}"
