@@ -1,0 +1,58 @@
+send_anonymous_usage_stats: true
+project_id: "tap-newmode"
+default_environment: test
+requires_meltano: ">=4.0"
+environments:
+- name: test
+plugins:
+  extractors:
+  - name: "tap-newmode"
+    namespace: "tap_newmode"
+    pip_url: -e .
+    capabilities:
+    - state
+    - catalog
+    - discover
+    - about
+    - stream-maps
+    - structured-logging
+
+    # TODO: Declare settings and their types here:
+    settings:
+    - name: client_id
+      label: Client ID
+      description: OAuth client ID for the NewMode OAuth app
+      sensitive: true
+
+    - name: client_secret
+      label: Password
+      description: OAuth client secret for the NewMode OAuth app
+      sensitive: true
+
+    - name: refresh_token
+      label: Refresh Token
+      description: OAuth refresh token for the NewMode OAuth app
+      sensitive: true
+
+    - name: start_date
+      kind: date_iso8601
+      label: Start Date
+      description: Initial date to start extracting data from
+
+    - name: api_url
+      label: API URL
+      description: Base URL for the NewMode API
+
+    # TODO: Declare required settings here:
+    settings_group_validation:
+    - [client_id, client_secret]
+
+    # TODO: Declare default configuration values here:
+    config:
+      start_date: 6 months ago
+      api_url: https://base.newmode.net
+
+  loaders:
+  - name: target-jsonl
+    variant: andyh1203
+    pip_url: target-jsonl
