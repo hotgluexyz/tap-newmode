@@ -105,30 +105,100 @@ def test_catalog_covers_every_contact_field(contacts_stream):
     assert not expected - set(properties)
 
 
-def test_get_next_page_token_reads_offset_from_next_link(contacts_stream):
-    """The next offset is taken from the `links.next` href the API advertises."""
+class _FakeResponse:
+    """Minimal stand-in exposing just what the stream reads off a response."""
 
-    class _Response:
-        @staticmethod
-        def json():
-            return {
-                "links": {
-                    "next": {
-                        "href": "https://base.newmode.net/jsonapi/contact/contact"
-                        "?page%5Boffset%5D=5&page%5Blimit%5D=5",
-                    },
-                },
-            }
+    def __init__(
+        self, body, status_code=200, url="https://base.newmode.net/jsonapi/contact/contact"
+    ):
+        self._body = body
+        self.status_code = status_code
+        self.url = url
+        self.reason = "Error"
+        self.text = "body text"
 
-    assert contacts_stream.get_next_page_token(_Response(), None) == 5
+    def json(self):
+        if isinstance(self._body, ValueError):
+            raise self._body
+        return self._body
 
 
-def test_get_next_page_token_ends_without_next_link(contacts_stream):
-    """Pagination stops once the API stops advertising a next page."""
+_NEXT_URL = "https://base.newmode.net/jsonapi/contact/contact?page%5Boffset%5D=5&page%5Blimit%5D=5"
 
-    class _Response:
-        @staticmethod
-        def json():
-            return {"links": {"self": {"href": "https://base.newmode.net/x"}}}
 
-    assert contacts_stream.get_next_page_token(_Response(), 5) is None
+@pytest.mark.parametrize(
+    "links",
+    [
+        pytest.param({"next": {"href": _NEXT_URL}}, id="link-object"),
+        # JSON:API also allows a link to be a plain URI string.
+        pytest.param({"next": _NEXT_URL}, id="link-string"),
+        pytest.param({"next": "?page%5Boffset%5D=5&page%5Blimit%5D=5"}, id="relative-string"),
+    ],
+)
+def test_get_next_page_token_reads_offset_from_next_link(contacts_stream, links):
+    """The next offset is read from `links.next`, whether object or string form."""
+    assert contacts_stream.get_next_page_token(_FakeResponse({"links": links}), None) == 5
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"links": {"self": {"href": "https://base.newmode.net/x"}}}, id="no-next"),
+        pytest.param({"links": {"next": None}}, id="null-next"),
+        pytest.param({"links": {"next": {}}}, id="empty-link-object"),
+        pytest.param({"links": {"next": ""}}, id="empty-string"),
+        pytest.param({"links": {"next": 42}}, id="non-string-link"),
+        pytest.param({"links": "not-an-object"}, id="links-not-an-object"),
+        pytest.param({}, id="no-links"),
+        pytest.param([], id="array-body"),
+        pytest.param(None, id="null-body"),
+        pytest.param(ValueError("no json"), id="html-body"),
+    ],
+)
+def test_get_next_page_token_ends_on_missing_or_malformed_link(contacts_stream, body):
+    """Pagination stops rather than raising when `links.next` is absent or malformed."""
+    assert contacts_stream.get_next_page_token(_FakeResponse(body), 5) is None
+
+
+def test_response_error_message_summarizes_jsonapi_errors(contacts_stream):
+    """A JSON:API errors array is reduced to pointer/detail pairs."""
+    body = {
+        "errors": [
+            {"detail": "Bad value.", "source": {"pointer": "/data/attributes/email"}},
+            {"title": "Conflict"},
+        ],
+    }
+    message = contacts_stream.response_error_message(_FakeResponse(body, status_code=422))
+
+    assert "/data/attributes/email: Bad value." in message
+    assert "Conflict" in message
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(None, id="null-body"),
+        pytest.param([], id="array-body"),
+        pytest.param({"errors": None}, id="null-errors"),
+        pytest.param({"errors": 5}, id="scalar-errors"),
+        pytest.param({"errors": "boom"}, id="string-errors"),
+        pytest.param({"errors": []}, id="empty-errors"),
+        pytest.param({"errors": ["plain string"]}, id="non-dict-entry"),
+        pytest.param({"errors": [{"source": "not-an-object", "detail": "Bad."}]}, id="bad-source"),
+        pytest.param(ValueError("no json"), id="html-body"),
+    ],
+)
+def test_response_error_message_handles_malformed_bodies(contacts_stream, body):
+    """Malformed or non-JSON error bodies fall back instead of raising."""
+    message = contacts_stream.response_error_message(_FakeResponse(body, status_code=504))
+
+    assert isinstance(message, str)
+    assert message
+
+
+def test_response_error_message_keeps_detail_when_source_is_malformed(contacts_stream):
+    """A non-object `source` is ignored but its sibling detail still reaches the message."""
+    body = {"errors": [{"source": "not-an-object", "detail": "Bad value."}]}
+    message = contacts_stream.response_error_message(_FakeResponse(body, status_code=422))
+
+    assert "Bad value." in message

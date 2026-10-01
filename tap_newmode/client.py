@@ -70,6 +70,33 @@ class NewModeStream(RESTStream):
         """Retry more than the SDK default, since 504s here are frequent."""
         return 8
 
+    @staticmethod
+    def _json_body(response: requests.Response) -> dict:
+        """Return the decoded body when it is a JSON object, otherwise an empty dict.
+
+        New/Mode answers gateway timeouts with HTML, and JSON:API permits a top-level
+        array, so the body is not assumed to decode to a dict.
+        """
+        try:
+            body = response.json()
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    @staticmethod
+    def _link_href(link: Any) -> str | None:
+        """Return the URL a JSON:API link points at.
+
+        A link is either a URI string or an object with an `href`, so both are
+        accepted here. https://jsonapi.org/format/#document-links
+        """
+        if isinstance(link, str):
+            return link or None
+        if isinstance(link, dict):
+            href = link.get("href")
+            return href if isinstance(href, str) and href else None
+        return None
+
     @override
     def get_next_page_token(
         self,
@@ -91,8 +118,8 @@ class NewModeStream(RESTStream):
         .. _requests.Response:
             https://requests.readthedocs.io/en/latest/api/#requests.Response
         """
-        next_link = (response.json().get("links") or {}).get("next") or {}
-        next_href = next_link.get("href")
+        links = self._json_body(response).get("links")
+        next_href = self._link_href(links.get("next") if isinstance(links, dict) else None)
         if not next_href:
             return None
 
@@ -137,19 +164,24 @@ class NewModeStream(RESTStream):
         .. _requests.Response:
             https://requests.readthedocs.io/en/latest/api/#requests.Response
         """
-        try:
-            errors = response.json().get("errors")
-        except ValueError:
-            errors = None
-        if not errors:
+        errors = self._json_body(response).get("errors")
+        if not isinstance(errors, list):
             return super().response_error_message(response)
 
         details = []
         for error in errors:
             if not isinstance(error, dict):
                 continue
-            pointer = (error.get("source") or {}).get("pointer")
+            source = error.get("source")
+            pointer = source.get("pointer") if isinstance(source, dict) else None
             detail = error.get("detail") or error.get("title") or ""
-            details.append(f"{pointer}: {detail}" if pointer else detail)
-        summary = "; ".join(detail for detail in details if detail)
+            if not isinstance(detail, str):
+                detail = str(detail)
+            if not detail:
+                continue
+            details.append(f"{pointer}: {detail}" if isinstance(pointer, str) else detail)
+
+        if not details:
+            return super().response_error_message(response)
+        summary = "; ".join(details)
         return f"{response.status_code} from {urlparse(response.url).path}: {summary}"
