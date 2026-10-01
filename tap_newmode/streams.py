@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, ClassVar
 
 from hotglue_singer_sdk import typing as th  # JSON Schema typing helpers
 from typing_extensions import override
@@ -29,7 +29,7 @@ class ContactsStream(NewModeStream):
 
     name = "contacts"
     path = "/contact/contact"
-    primary_keys = ["id"]
+    primary_keys: ClassVar[list[str]] = ["id"]
     replication_key = None
 
     schema = th.PropertiesList(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from functools import cached_property
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
 import backoff
@@ -28,7 +28,7 @@ class NewModeStream(RESTStream):
 
     # The contact collection routinely takes ~55s and the upstream gateway cuts
     # requests off at 60s, so 504s are common and expected rather than fatal.
-    extra_retry_statuses: list[int] = [429, 504]
+    extra_retry_statuses: ClassVar[list[int]] = [429, 504]
 
     @override
     @property
