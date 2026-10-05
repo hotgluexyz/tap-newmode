@@ -4,8 +4,10 @@ import copy
 import datetime
 
 import pytest
+from hotglue_singer_sdk.exceptions import ConfigValidationError
 from hotglue_singer_sdk.testing import get_standard_tap_tests
 
+from tap_newmode.client import resolve_base_url
 from tap_newmode.tap import TapNewMode
 
 SAMPLE_CONFIG = {
@@ -35,6 +37,9 @@ def contacts_stream():
     tap = TapNewMode(config=SAMPLE_CONFIG, parse_env_config=False)
     return next(s for s in tap.discover_streams() if s.name == "contacts")
 
+
+# Marks a test case where the attribute is omitted entirely rather than null.
+_ABSENT = object()
 
 # A trimmed JSON:API resource shaped like a real New/Mode contact response.
 SAMPLE_RESOURCE = {
@@ -232,19 +237,85 @@ def test_post_process_keeps_records_when_no_bookmark(contacts_stream, monkeypatc
     assert contacts_stream.post_process(SAMPLE_RESOURCE) is not None
 
 
-def test_post_process_keeps_records_with_unusable_changed(contacts_stream, monkeypatch):
-    """A record with a missing or unparseable `changed` is kept, not silently dropped."""
+def test_post_process_falls_back_to_created_when_changed_unusable(contacts_stream):
+    """A missing or unparseable `changed` falls back to `created`, as Drupal initializes it."""
+    for bad in (None, "", "not-a-number", _ABSENT):
+        row = copy.deepcopy(SAMPLE_RESOURCE)
+        if bad is _ABSENT:
+            del row["attributes"]["changed"]
+        else:
+            row["attributes"]["changed"] = bad
+        record = contacts_stream.post_process(row)
+        assert record is not None, f"dropped record with changed={bad!r}"
+        assert record["changed"] == record["created"] == "2023-04-24T20:54:33+00:00"
+
+
+def test_post_process_skips_record_without_any_usable_timestamp(contacts_stream):
+    """With neither `changed` nor `created` usable the record cannot be tracked."""
+    row = copy.deepcopy(SAMPLE_RESOURCE)
+    row["attributes"]["changed"] = None
+    del row["attributes"]["created"]
+    assert contacts_stream.post_process(row) is None
+
+
+@pytest.mark.parametrize("changed", [None, _ABSENT])
+def test_fallback_record_is_not_filtered_by_bookmark(contacts_stream, monkeypatch, changed):
+    """A contact using the `created` fallback is emitted even when `created` is older.
+
+    Filtering on the fallback would drop an updated contact on every run, so it never
+    reaches the target.
+    """
     monkeypatch.setattr(
         type(contacts_stream),
         "get_starting_timestamp",
-        lambda self, context: datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc),
+        lambda self, context: datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
     )
-    for bad in (None, "", "not-a-number"):
-        row = copy.deepcopy(SAMPLE_RESOURCE)
-        row["attributes"]["changed"] = bad
+    row = copy.deepcopy(SAMPLE_RESOURCE)  # created = 2023-04-24, well before the bookmark
+    if changed is _ABSENT:
+        del row["attributes"]["changed"]
+    else:
+        row["attributes"]["changed"] = changed
+
+    record = contacts_stream.post_process(row)
+
+    assert record is not None
+    assert record["changed"] == "2023-04-24T20:54:33+00:00"
+
+
+def test_fallback_record_does_not_rewind_state(contacts_stream):
+    """An older fallback value leaves the bookmark at the newest real `changed`."""
+    later = copy.deepcopy(SAMPLE_RESOURCE)
+    later["attributes"]["changed"] = "1789000000"
+    fallback = copy.deepcopy(SAMPLE_RESOURCE)
+    fallback["attributes"]["changed"] = None
+
+    for row in (later, fallback):
+        contacts_stream._increment_stream_state(contacts_stream.post_process(row), context=None)
+
+    state = contacts_stream.get_context_state(None)
+    marker = state.get("progress_markers", state)
+    assert marker["replication_key_value"] == "2026-09-10T00:26:40+00:00"
+
+
+@pytest.mark.parametrize("changed", [None, _ABSENT])
+def test_state_advances_past_record_without_changed(contacts_stream, changed):
+    """Regression: a record lacking `changed` must not crash the SDK's state update.
+
+    `increment_state` indexes the replication key and compares it to the prior value,
+    raising KeyError or TypeError, and `_sync_records` does not catch either.
+    """
+    later = copy.deepcopy(SAMPLE_RESOURCE)
+    later["attributes"]["changed"] = "1789000000"
+    missing = copy.deepcopy(SAMPLE_RESOURCE)
+    if changed is _ABSENT:
+        del missing["attributes"]["changed"]
+    else:
+        missing["attributes"]["changed"] = changed
+
+    for row in (later, missing):
         record = contacts_stream.post_process(row)
-        assert record is not None, f"dropped record with changed={bad!r}"
-        assert record["changed"] is None
+        assert record is not None
+        contacts_stream._increment_stream_state(record, context=None)
 
 
 def test_post_process_tolerates_naive_bookmark(contacts_stream, monkeypatch):
@@ -255,3 +326,40 @@ def test_post_process_tolerates_naive_bookmark(contacts_stream, monkeypatch):
         lambda self, context: datetime.datetime(2030, 1, 1),  # noqa: DTZ001
     )
     assert contacts_stream.post_process(SAMPLE_RESOURCE) is None
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        pytest.param(None, "https://base.newmode.net", id="default"),
+        pytest.param("https://base.newmode.net/", "https://base.newmode.net", id="https"),
+    ],
+)
+def test_resolve_base_url_accepts_safe_urls(configured, expected):
+    """HTTPS URLs are accepted, with any trailing slash removed."""
+    assert resolve_base_url({"api_base_url": configured}) == expected
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        pytest.param("http://base.newmode.net", id="http-remote"),
+        pytest.param("ftp://base.newmode.net", id="other-scheme"),
+        pytest.param("base.newmode.net", id="no-scheme"),
+        pytest.param("https://", id="no-host"),
+    ],
+)
+def test_resolve_base_url_rejects_cleartext_or_malformed_urls(configured):
+    """Anything that could send secrets in cleartext, or is malformed, is refused."""
+    with pytest.raises(ConfigValidationError):
+        resolve_base_url({"api_base_url": configured})
+
+
+def test_token_endpoint_refuses_cleartext_base_url():
+    """The OAuth endpoint, which receives the client secret, is never built over http."""
+    tap = TapNewMode(
+        config={**SAMPLE_CONFIG, "api_base_url": "http://base.newmode.net"},
+        parse_env_config=False,
+    )
+    with pytest.raises(ConfigValidationError):
+        TapNewMode.access_token_support(tap)

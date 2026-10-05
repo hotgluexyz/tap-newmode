@@ -37,8 +37,14 @@ endpoint up.
 
 So the stream fetches the whole collection and drops records older than the bookmark in
 `post_process`. This does not reduce load on the API — the full collection is still read
-every run — but it does keep already-synced records from reaching the target. Records with
-a missing or unparseable `changed` are always kept rather than silently dropped.
+every run — but it does keep already-synced records from reaching the target.
+
+Every emitted record must carry a usable `changed`: the SDK reads it to advance state and
+raises on a missing or null value, which would end the sync. When `changed` is unusable it
+falls back to `created`, since Drupal initializes `changed` to `created`. A fallback value
+is never compared to the bookmark — it says nothing about when the contact last changed, so
+filtering on it could drop an updated contact forever — and such records are re-emitted on
+every sync instead. A record with neither timestamp is skipped with a warning.
 
 If New/Mode makes the collection fast enough to filter server-side, move the comparison
 into `get_url_params` and delete `_is_before_bookmark`.

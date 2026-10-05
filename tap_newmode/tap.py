@@ -10,7 +10,7 @@ from hotglue_singer_sdk.authenticators import OAuthAuthenticator
 from typing_extensions import override
 
 from tap_newmode.auth import NewModeAuthenticator
-from tap_newmode.client import DEFAULT_BASE_URL
+from tap_newmode.client import DEFAULT_BASE_URL, resolve_base_url
 from tap_newmode.streams import (
     ContactsStream,
 )
@@ -90,9 +90,7 @@ class TapNewMode(Tap):
         Returns:
             A tuple with the authenticator class and the OAuth token endpoint URL.
         """
-        base_url = DEFAULT_BASE_URL
-        if connector is not None:
-            base_url = (connector.config.get("api_base_url") or DEFAULT_BASE_URL).rstrip("/")
+        base_url = resolve_base_url(connector.config) if connector is not None else DEFAULT_BASE_URL
         return NewModeAuthenticator, f"{base_url}/oauth/token"
 
 

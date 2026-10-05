@@ -9,12 +9,29 @@ from urllib.parse import parse_qs, urlparse
 import backoff
 import requests
 from hotglue_singer_sdk.authenticators import APIAuthenticatorBase
+from hotglue_singer_sdk.exceptions import ConfigValidationError
 from hotglue_singer_sdk.streams import RESTStream
 from typing_extensions import override
 
 JSON_API_MEDIA_TYPE = "application/vnd.api+json"
 DEFAULT_BASE_URL = "https://base.newmode.net"
 PAGE_SIZE = 50
+
+
+def resolve_base_url(config: dict) -> str:
+    """Return the configured New/Mode base URL, refusing to send secrets in cleartext.
+
+    The client secret is posted to `<base>/oauth/token` and the access token is sent as a
+    Bearer header to every API request, so only HTTPS is accepted.
+
+    Raises:
+        ConfigValidationError: If the URL is not HTTPS.
+    """
+    base_url = (config.get("api_base_url") or DEFAULT_BASE_URL).rstrip("/")
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ConfigValidationError(f"api_base_url must use https://; got {base_url!r}.")
+    return base_url
 
 
 class NewModeStream(RESTStream):
@@ -34,8 +51,7 @@ class NewModeStream(RESTStream):
     @property
     def url_base(self) -> str:
         """Return the JSON:API root, configurable via the ``api_base_url`` setting."""
-        base_url = (self.config.get("api_base_url") or DEFAULT_BASE_URL).rstrip("/")
-        return f"{base_url}/jsonapi"
+        return f"{resolve_base_url(self.config)}/jsonapi"
 
     @override
     @cached_property

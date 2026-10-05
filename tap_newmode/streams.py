@@ -164,14 +164,8 @@ class ContactsStream(NewModeStream):
             if isinstance(item, dict) and item.get("id") and item["id"] != _MISSING_REFERENCE
         ]
 
-    def _is_before_bookmark(self, changed: datetime | None, context: dict | None) -> bool:
-        """Return True when a record predates the bookmark and should be skipped.
-
-        Records with no usable `changed` are always kept rather than silently dropped.
-        """
-        if changed is None:
-            return False
-
+    def _is_before_bookmark(self, changed: datetime, context: dict | None) -> bool:
+        """Return True when a record predates the bookmark and should be skipped."""
         starting = self.get_starting_timestamp(context)
         if starting is None:
             return False
@@ -204,14 +198,27 @@ class ContactsStream(NewModeStream):
             **(row.get("attributes") or {}),
         }
 
+        created = self._parse_timestamp(record.get("created"))
+        # `changed` is the replication key, so every emitted record needs a usable value:
+        # the SDK indexes it when advancing state and raises on a missing or null one.
+        # Drupal initializes `changed` to `created`, so that is the fallback.
         changed = self._parse_timestamp(record.get("changed"))
-        if self._is_before_bookmark(changed, context):
+        if changed is None:
+            if created is None:
+                self.logger.warning(
+                    "Skipping contact %s: neither `changed` nor `created` is a usable timestamp.",
+                    record.get("id"),
+                )
+                return None
+            # A fallback `created` says nothing about when the contact last changed, so
+            # it is never compared to the bookmark; filtering on it could drop an updated
+            # contact on every run. The record is re-emitted each sync instead.
+            changed = created
+        elif self._is_before_bookmark(changed, context):
             return None
 
-        for timestamp_field in ("created", "changed"):
-            if timestamp_field in record:
-                parsed = self._parse_timestamp(record[timestamp_field])
-                record[timestamp_field] = parsed.isoformat() if parsed else None
+        record["created"] = created.isoformat() if created else None
+        record["changed"] = changed.isoformat()
 
         relationships = row.get("relationships") or {}
         for relationship_name in ("groups", "entitygroupfield"):
