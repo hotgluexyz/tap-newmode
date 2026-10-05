@@ -30,7 +30,7 @@ class ContactsStream(NewModeStream):
     name = "contacts"
     path = "/contact/contact"
     primary_keys: ClassVar[list[str]] = ["id"]
-    replication_key = None
+    replication_key = "changed"
 
     schema = th.PropertiesList(
         # Resource identity
@@ -139,15 +139,14 @@ class ContactsStream(NewModeStream):
     ).to_dict()
 
     @staticmethod
-    def _to_datetime(value: Any) -> Any:
-        """Convert New/Mode's epoch-second timestamps to RFC 3339, leaving others alone."""
+    def _parse_timestamp(value: Any) -> datetime | None:
+        """Parse one of New/Mode's epoch-second timestamps, or None if unparseable."""
         if value in (None, ""):
             return None
         try:
-            epoch = int(value)
-        except (TypeError, ValueError):
-            return value
-        return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+            return datetime.fromtimestamp(int(value), tz=timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
 
     @staticmethod
     def _relationship_ids(relationship: Any) -> list[str]:
@@ -164,6 +163,22 @@ class ContactsStream(NewModeStream):
             for item in data
             if isinstance(item, dict) and item.get("id") and item["id"] != _MISSING_REFERENCE
         ]
+
+    def _is_before_bookmark(self, changed: datetime | None, context: dict | None) -> bool:
+        """Return True when a record predates the bookmark and should be skipped.
+
+        Records with no usable `changed` are always kept rather than silently dropped.
+        """
+        if changed is None:
+            return False
+
+        starting = self.get_starting_timestamp(context)
+        if starting is None:
+            return False
+        if starting.tzinfo is None:
+            starting = starting.replace(tzinfo=timezone.utc)
+
+        return changed < starting
 
     @override
     def post_process(
@@ -189,9 +204,14 @@ class ContactsStream(NewModeStream):
             **(row.get("attributes") or {}),
         }
 
+        changed = self._parse_timestamp(record.get("changed"))
+        if self._is_before_bookmark(changed, context):
+            return None
+
         for timestamp_field in ("created", "changed"):
             if timestamp_field in record:
-                record[timestamp_field] = self._to_datetime(record[timestamp_field])
+                parsed = self._parse_timestamp(record[timestamp_field])
+                record[timestamp_field] = parsed.isoformat() if parsed else None
 
         relationships = row.get("relationships") or {}
         for relationship_name in ("groups", "entitygroupfield"):

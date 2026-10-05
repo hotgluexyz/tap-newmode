@@ -1,5 +1,6 @@
 """Tests standard tap features using the built-in SDK tests library."""
 
+import copy
 import datetime
 
 import pytest
@@ -202,3 +203,55 @@ def test_response_error_message_keeps_detail_when_source_is_malformed(contacts_s
     message = contacts_stream.response_error_message(_FakeResponse(body, status_code=422))
 
     assert "Bad value." in message
+
+
+def test_replication_key_is_changed(contacts_stream):
+    """`changed` drives incremental state."""
+    assert contacts_stream.replication_key == "changed"
+    assert contacts_stream.is_timestamp_replication_key
+
+
+def test_post_process_skips_records_older_than_bookmark(contacts_stream, monkeypatch):
+    """Records that predate the bookmark are dropped, since the API cannot filter."""
+    monkeypatch.setattr(
+        type(contacts_stream),
+        "get_starting_timestamp",
+        lambda self, context: datetime.datetime(2023, 4, 24, 21, 0, tzinfo=datetime.timezone.utc),
+    )
+    # SAMPLE_RESOURCE changed = 1682372350 -> 2023-04-24T21:39:10Z, after the bookmark.
+    assert contacts_stream.post_process(SAMPLE_RESOURCE) is not None
+
+    older = copy.deepcopy(SAMPLE_RESOURCE)
+    older["attributes"]["changed"] = "1682369673"  # 2023-04-24T20:54:33Z, before it
+    assert contacts_stream.post_process(older) is None
+
+
+def test_post_process_keeps_records_when_no_bookmark(contacts_stream, monkeypatch):
+    """With no bookmark yet, nothing is filtered out."""
+    monkeypatch.setattr(type(contacts_stream), "get_starting_timestamp", lambda self, context: None)
+    assert contacts_stream.post_process(SAMPLE_RESOURCE) is not None
+
+
+def test_post_process_keeps_records_with_unusable_changed(contacts_stream, monkeypatch):
+    """A record with a missing or unparseable `changed` is kept, not silently dropped."""
+    monkeypatch.setattr(
+        type(contacts_stream),
+        "get_starting_timestamp",
+        lambda self, context: datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc),
+    )
+    for bad in (None, "", "not-a-number"):
+        row = copy.deepcopy(SAMPLE_RESOURCE)
+        row["attributes"]["changed"] = bad
+        record = contacts_stream.post_process(row)
+        assert record is not None, f"dropped record with changed={bad!r}"
+        assert record["changed"] is None
+
+
+def test_post_process_tolerates_naive_bookmark(contacts_stream, monkeypatch):
+    """A tz-naive bookmark is treated as UTC rather than raising on comparison."""
+    monkeypatch.setattr(
+        type(contacts_stream),
+        "get_starting_timestamp",
+        lambda self, context: datetime.datetime(2030, 1, 1),  # noqa: DTZ001
+    )
+    assert contacts_stream.post_process(SAMPLE_RESOURCE) is None

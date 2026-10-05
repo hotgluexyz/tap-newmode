@@ -13,24 +13,38 @@ A [Singer](https://www.singer.io/) tap that extracts data from **New/Mode**. It 
 
 | Stream | Endpoint | Primary key | Replication |
 | ------ | -------- | ----------- | ----------- |
-| `contacts` | `GET /jsonapi/contact/contact` | `id` (contact uuid) | Full table |
+| `contacts` | `GET /jsonapi/contact/contact` | `id` (contact uuid) | Incremental on `changed` (filtered client-side) |
 
 Records are flattened out of the JSON:API envelope: `attributes` are lifted to the top
 level so field names match `target-newmode`, the resource `id` and `type` are kept, and
 `groups` / `entitygroupfield` are reduced to lists of uuids. The `created` and `changed`
 timestamps arrive as epoch-second strings and are converted to RFC 3339.
 
-#### Why `contacts` is full table
+#### Why `changed` is filtered client-side
 
-New/Mode's contact collection is slow — a single page takes roughly 55 seconds, and the
-upstream gateway cuts requests off at 60, so `504 Gateway Time-out` is common. Adding
-`sort=changed` with a `filter[...]` on `changed` pushed every request past that ceiling:
-13 consecutive attempts returned 504 or timed out, while unfiltered requests to the same
-collection succeeded regularly. Server-side incremental filtering is therefore not usable
-on this API today, and the stream syncs full table.
+`changed` is the replication key, but the filtering happens in the tap rather than in the
+query. New/Mode's contact collection is slow — a single page takes roughly 55-60 seconds
+against an upstream gateway that cuts requests off at 60, so `504 Gateway Time-out` is
+common even with no filter applied.
 
-To compensate, `504` is treated as retriable alongside `429`, and the stream retries up to
-8 times with capped exponential backoff.
+Drupal JSON:API does support `filter` and `sort` on `changed`, and this is not a confirmed
+limitation of the API. What was observed is narrower: across 13 attempts, no request
+carrying `sort=changed` plus a `filter[...]` on `changed` ever returned before the gateway
+timed out. Because the *unfiltered* collection also fails a large share of the time, those
+failures cannot be cleanly attributed to the filter — it may simply be the same
+response-time problem. Server-side filtering is worth retrying if New/Mode speeds the
+endpoint up.
+
+So the stream fetches the whole collection and drops records older than the bookmark in
+`post_process`. This does not reduce load on the API — the full collection is still read
+every run — but it does keep already-synced records from reaching the target. Records with
+a missing or unparseable `changed` are always kept rather than silently dropped.
+
+If New/Mode makes the collection fast enough to filter server-side, move the comparison
+into `get_url_params` and delete `_is_before_bookmark`.
+
+To compensate for the timeouts, `504` is treated as retriable alongside `429`, and the
+stream retries up to 8 times with capped exponential backoff.
 
 #### Field types
 
