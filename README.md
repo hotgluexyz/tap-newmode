@@ -1,22 +1,65 @@
 # tap-newmode
 
-A [Singer](https://www.singer.io/) tap that extracts data from **NewMode**. It is built with [hotglue-singer-sdk](https://github.com/hotgluexyz/HotglueSingerSDK) and speaks the standard Singer message protocol on stdout, so you can pair it with any compatible target.
+A [Singer](https://www.singer.io/) tap that extracts data from **New/Mode**. It is built with [hotglue-singer-sdk](https://github.com/hotgluexyz/HotglueSingerSDK) and speaks the standard Singer message protocol on stdout, so you can pair it with any compatible target.
 
 ## Features
 
-- **REST**-style HTTP streams (see `client.py` / `streams.py`).
-- **OAuth2** with access token support via Hotglue (`access_token_support` on the tap).
-
-- Configurable **`api_url`** and optional **`start_date`** (see [Configuration](#configuration)).
-- Incremental sync is scaffolded with placeholder **`id`** (primary key) and **`modified_at`** (replication key); replace with real fields per stream in `streams.py`.
+- **REST** streams over New/Mode's Drupal [JSON:API](https://jsonapi.org/) (see `client.py` / `streams.py`).
+- **OAuth2** client-credentials auth, with optional token fetching via the Hotglue access token endpoint.
+- Config keys mirror [`target-newmode`](https://github.com/hotgluexyz/target-newmode), so one connector config drives both.
+- Offset pagination driven by the `links.next` href the API advertises.
 
 ### Streams
 
-| Stream | Endpoint / notes | Primary key | Replication key |
-| ------ | ---------------- | ----------- | ----------------- |
-| `contacts` | `GET` + `/contacts` (default path; TODO: confirm with API) | `id` (TODO) | `modified_at` (TODO) |
+| Stream | Endpoint | Primary key | Replication |
+| ------ | -------- | ----------- | ----------- |
+| `contacts` | `GET /jsonapi/contact/contact` | `id` (contact uuid) | Incremental on `changed` (filtered client-side) |
 
-TODO: Describe pagination, rate limits, and any stream-specific query parameters in this section.
+Records are flattened out of the JSON:API envelope: `attributes` are lifted to the top
+level so field names match `target-newmode`, the resource `id` and `type` are kept, and
+`groups` / `entitygroupfield` are reduced to lists of uuids. The `created` and `changed`
+timestamps arrive as epoch-second strings and are converted to RFC 3339.
+
+#### Why `changed` is filtered client-side
+
+`changed` is the replication key, but the filtering happens in the tap rather than in the
+query. New/Mode's contact collection is slow — a single page takes roughly 55-60 seconds
+against an upstream gateway that cuts requests off at 60, so `504 Gateway Time-out` is
+common even with no filter applied.
+
+Drupal JSON:API does support `filter` and `sort` on `changed`, and this is not a confirmed
+limitation of the API. What was observed is narrower: across 13 attempts, no request
+carrying `sort=changed` plus a `filter[...]` on `changed` ever returned before the gateway
+timed out. Because the *unfiltered* collection also fails a large share of the time, those
+failures cannot be cleanly attributed to the filter — it may simply be the same
+response-time problem. Server-side filtering is worth retrying if New/Mode speeds the
+endpoint up.
+
+So the stream fetches the whole collection and drops records older than the bookmark in
+`post_process`. This does not reduce load on the API — the full collection is still read
+every run — but it does keep already-synced records from reaching the target.
+
+Every emitted record must carry a usable `changed`: the SDK reads it to advance state and
+raises on a missing or null value, which would end the sync. When `changed` is unusable it
+falls back to `created`, since Drupal initializes `changed` to `created`. A fallback value
+is never compared to the bookmark — it says nothing about when the contact last changed, so
+filtering on it could drop an updated contact forever — and such records are re-emitted on
+every sync instead. A record with neither timestamp is skipped with a warning.
+
+If New/Mode makes the collection fast enough to filter server-side, move the comparison
+into `get_url_params` and delete `_is_before_bookmark`.
+
+To compensate for the timeouts, `504` is treated as retriable alongside `429`, and the
+stream retries up to 8 times with capped exponential backoff.
+
+#### Field types
+
+Eight attributes were null for every contact in the reference account
+(`name_suffix`, `subscriber`, `sync_status`, `latest_sync_status` and the four
+`donation_*` fields), and New/Mode's install exposes no JSON:API schema, OpenAPI or
+Drupal `field_config` route to confirm them against. Those are typed permissively in
+`streams.py` so an unexpected value cannot fail a sync; tighten them if the vendor
+documents the real types.
 
 ## Requirements
 
@@ -51,11 +94,18 @@ tap-newmode --help
 
 | Setting | Type | Required | Default | Description |
 | ------- | ---- | -------- | ------- | ----------- |
+| `client_id` | string | yes | — | New/Mode OAuth client id. |
+| `client_secret` | string | yes | — | New/Mode OAuth client secret. |
+| `api_base_url` | string | no | `https://base.newmode.net` | New/Mode API base URL. |
 | `start_date` | string (datetime) | no | `2000-01-01T00:00:00Z` | Earliest record date to sync. |
-| `api_url` | string | no | `https://base.newmode.net` | Base URL for the API. |
-| `client_id` | string | yes | — | OAuth client ID. |
-| `client_secret` | string | yes | — | OAuth client secret. |
-| `refresh_token` | string | no | — | OAuth refresh token (if applicable). |
+| `_refresh_token_via_hg_api` | boolean | no | `false` | Fetch tokens from the Hotglue access token endpoint. |
+| `access_token` | string | no | — | Current access token; written back by the tap. |
+| `expires_in` | integer | no | — | Epoch seconds when the token expires; managed by the tap. |
+
+`client_id`, `client_secret`, `api_base_url`, `access_token` and `expires_in` use the same
+names and semantics as `target-newmode`. Target-only keys (`org_id`, `gid`,
+`default_country`, `only_upsert_empty_fields`, `lookup_method`, `lookup_fields`) are
+ignored by the tap, so a shared config is safe to pass to either.
 
 Run `tap-newmode --about` (or `tap-newmode --about --format=markdown`) for the authoritative schema for your installed version.
 
@@ -63,11 +113,10 @@ Run `tap-newmode --about` (or `tap-newmode --about --format=markdown`) for the a
 
 ```json
 {
-  "start_date": "2000-01-01T00:00:00Z",
-  "api_url": "https://base.newmode.net",
   "client_id": "YOUR_CLIENT_ID",
   "client_secret": "YOUR_CLIENT_SECRET",
-  "refresh_token": ""
+  "api_base_url": "https://base.newmode.net",
+  "start_date": "2000-01-01T00:00:00Z"
 }
 ```
 
@@ -107,7 +156,20 @@ tap-newmode --about
 
 ## API / documentation
 
-TODO: Add your vendor’s base URLs, auth docs, and links (compare to the “API hosts” section in a finished tap README).
+- **Base URL:** `https://base.newmode.net`
+- **Token endpoint:** `POST /oauth/token` (grant type `client_credentials`; tokens last 300 seconds and no refresh token is issued)
+- **Contacts:** `GET /jsonapi/contact/contact`, requiring the `application/vnd.api+json` Accept header — New/Mode answers `application/json` with a 415
+- Reference: New/Mode Impact v2.1 API summary
+
+Note that the v2.1 REST API documented under `/api/v2.1` is a separate surface from the
+Drupal JSON:API routes under `/jsonapi` that this tap reads.
+
+### Hotglue access token endpoint
+
+Set `"_refresh_token_via_hg_api": true` and provide the `TENANT`, `API_KEY`, `FLOW`,
+`ENV_ID` and `TAP` environment variables to fetch tokens from Hotglue instead of running
+the client-credentials grant against New/Mode directly. It defaults to `false` so local
+runs work without that environment.
 
 
 ## License
