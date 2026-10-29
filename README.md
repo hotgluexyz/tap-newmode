@@ -13,12 +13,17 @@ A [Singer](https://www.singer.io/) tap that extracts data from **New/Mode**. It 
 
 | Stream | Endpoint | Primary key | Replication |
 | ------ | -------- | ----------- | ----------- |
-| `contacts` | `GET /jsonapi/contact/contact` | `id` (contact uuid) | Incremental on `changed` (filtered client-side) |
+| `contacts` | `GET /jsonapi/contact/contact` | none | Incremental on `changed` (filtered client-side) |
 
 Records are flattened out of the JSON:API envelope: `attributes` are lifted to the top
-level so field names match `target-newmode`, the resource `id` and `type` are kept, and
-`groups` / `entitygroupfield` are reduced to lists of uuids. The `created` and `changed`
-timestamps arrive as epoch-second strings and are converted to RFC 3339.
+level so field names match `target-newmode`, the resource `type` is kept, and `groups` is
+reduced to a list of uuids. The `created` and `changed` timestamps arrive as epoch-second
+strings and are converted to RFC 3339.
+
+Fields New/Mode manages itself are left out of discovery and records, so they are not
+offered as mapping options for `target-newmode`: `id`, `drupal_internal__id`,
+`drupal_internal__revision_id`, `entitygroupfield`, `org_id`, `nm_marketing_opt_in`,
+`nm_product_opt_in`, `sync_status` and `latest_sync_status`.
 
 #### Why `changed` is filtered client-side
 
@@ -54,8 +59,8 @@ stream retries up to 8 times with capped exponential backoff.
 
 #### Field types
 
-Eight attributes were null for every contact in the reference account
-(`name_suffix`, `subscriber`, `sync_status`, `latest_sync_status` and the four
+Six attributes were null for every contact in the reference account
+(`name_suffix`, `subscriber` and the four
 `donation_*` fields), and New/Mode's install exposes no JSON:API schema, OpenAPI or
 Drupal `field_config` route to confirm them against. Those are typed permissively in
 `streams.py` so an unexpected value cannot fail a sync; tighten them if the vendor
