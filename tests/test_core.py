@@ -323,7 +323,7 @@ def test_post_process_tolerates_naive_bookmark(contacts_stream, monkeypatch):
     monkeypatch.setattr(
         type(contacts_stream),
         "get_starting_timestamp",
-        lambda self, context: datetime.datetime(2030, 1, 1),  # noqa: DTZ001
+        lambda self, context: datetime.datetime(2030, 1, 1),
     )
     assert contacts_stream.post_process(SAMPLE_RESOURCE) is None
 

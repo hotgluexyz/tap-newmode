@@ -23,34 +23,32 @@ _UNVERIFIED_DECIMAL = th.CustomType({"type": ["number", "string"]})
 # resolved for the current credentials.
 _MISSING_REFERENCE = "missing"
 
+NEWMODE_MANAGED_CONTACT_FIELDS = frozenset(
+    {
+        "id",
+        "drupal_internal__id",
+        "drupal_internal__revision_id",
+        "entitygroupfield",
+        "latest_sync_status",
+        "org_id",
+        "nm_marketing_opt_in",
+        "nm_product_opt_in",
+        "sync_status",
+    },
+)
+
 
 class ContactsStream(NewModeStream):
     """Stream for New/Mode contacts."""
 
     name = "contacts"
     path = "/contact/contact"
-    primary_keys: ClassVar[list[str]] = ["id"]
+    primary_keys: ClassVar[list[str]] = []
     replication_key = "changed"
 
     schema = th.PropertiesList(
         # Resource identity
-        th.Property("id", th.StringType, description="Contact uuid."),
         th.Property("type", th.StringType, description="JSON:API resource type."),
-        th.Property(
-            "drupal_internal__id",
-            th.IntegerType,
-            description="Numeric contact id used by the v2.1 REST API.",
-        ),
-        th.Property(
-            "drupal_internal__revision_id",
-            th.IntegerType,
-            description="Numeric id of the current contact revision.",
-        ),
-        th.Property(
-            "org_id",
-            th.IntegerType,
-            description="Numeric id of the organization the contact belongs to.",
-        ),
         # Name
         th.Property("honorific", th.StringType, description="Honorific, e.g. 'Ms'."),
         th.Property("first_name", th.StringType, description="Given name."),
@@ -71,24 +69,12 @@ class ContactsStream(NewModeStream):
         th.Property("longitude", th.NumberType, description="Geocoded longitude."),
         # Consent
         th.Property("opt_in", th.BooleanType, description="Opted in to the organization."),
-        th.Property(
-            "nm_product_opt_in",
-            th.BooleanType,
-            description="Opted in to New/Mode product messaging.",
-        ),
-        th.Property(
-            "nm_marketing_opt_in",
-            th.BooleanType,
-            description="Opted in to New/Mode marketing messaging.",
-        ),
         th.Property("subscriber", _UNVERIFIED, description="Subscriber reference."),
         # Timestamps (New/Mode returns epoch seconds as strings; converted to RFC 3339)
         th.Property("created", th.DateTimeType, description="When the contact was created."),
         th.Property("changed", th.DateTimeType, description="When the contact last changed."),
         # Sync and engagement
         th.Property("prefill_hash", th.StringType, description="Hash used to prefill forms."),
-        th.Property("sync_status", _UNVERIFIED, description="Sync status."),
-        th.Property("latest_sync_status", _UNVERIFIED, description="Most recent sync status."),
         th.Property(
             "supporter_engagement_score",
             th.IntegerType,
@@ -130,11 +116,6 @@ class ContactsStream(NewModeStream):
             "groups",
             th.ArrayType(th.StringType),
             description="Uuids of the contact groups the contact belongs to.",
-        ),
-        th.Property(
-            "entitygroupfield",
-            th.ArrayType(th.StringType),
-            description="Uuids of the group content entries for the contact.",
         ),
     ).to_dict()
 
@@ -193,10 +174,11 @@ class ContactsStream(NewModeStream):
             The flattened record.
         """
         record: dict[str, Any] = {
-            "id": row.get("id"),
             "type": row.get("type"),
             **(row.get("attributes") or {}),
         }
+        for managed_field in NEWMODE_MANAGED_CONTACT_FIELDS:
+            record.pop(managed_field, None)
 
         created = self._parse_timestamp(record.get("created"))
         # `changed` is the replication key, so every emitted record needs a usable value:
@@ -207,7 +189,7 @@ class ContactsStream(NewModeStream):
             if created is None:
                 self.logger.warning(
                     "Skipping contact %s: neither `changed` nor `created` is a usable timestamp.",
-                    record.get("id"),
+                    row.get("id"),
                 )
                 return None
             # A fallback `created` says nothing about when the contact last changed, so
@@ -221,9 +203,6 @@ class ContactsStream(NewModeStream):
         record["changed"] = changed.isoformat()
 
         relationships = row.get("relationships") or {}
-        for relationship_name in ("groups", "entitygroupfield"):
-            record[relationship_name] = self._relationship_ids(
-                relationships.get(relationship_name),
-            )
+        record["groups"] = self._relationship_ids(relationships.get("groups"))
 
         return record
